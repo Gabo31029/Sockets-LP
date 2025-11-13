@@ -255,15 +255,17 @@ class VideoClient:
     Patrón: Observer - Callback para notificar eventos
     """
     def __init__(self, host: str, port: int, room_id: int, client_id: int, 
-                 on_stop_callback: Optional[Callable] = None) -> None:
+                 username: str, on_stop_callback: Optional[Callable] = None) -> None:
         self.host = host
         self.port = port
         self.room_id = room_id
         self.client_id = client_id
+        self.username = username
         self.sock: Optional[socket.socket] = None
         self.running = False
         self.cap: Optional[cv2.VideoCapture] = None
-        self.remote_frames: Dict[int, np.ndarray] = {}
+        self.remote_frames: Dict[int, np.ndarray] = {}  # sender_id -> frame
+        self.remote_usernames: Dict[int, str] = {}  # sender_id -> username
         self.local_frame: Optional[np.ndarray] = None
         self.frames_lock = threading.Lock()
         self.on_stop_callback = on_stop_callback
@@ -298,7 +300,11 @@ class VideoClient:
                 with self.frames_lock:
                     self.local_frame = frame.copy()
                 _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-                packet = struct.pack('!II', self.room_id, self.client_id) + buffer.tobytes()
+                # Formato del paquete: room_id(4) | client_id(4) | username_len(4) | username(bytes) | frame_data(bytes)
+                username_bytes = self.username.encode('utf-8')
+                username_len = len(username_bytes)
+                packet = (struct.pack('!III', self.room_id, self.client_id, username_len) + 
+                         username_bytes + buffer.tobytes())
                 self.sock.sendto(packet, (self.host, self.port))
                 time.sleep(0.033)  # ~30 FPS
             except Exception as e:
@@ -310,17 +316,27 @@ class VideoClient:
         while self.running and self.sock:
             try:
                 data, _ = self.sock.recvfrom(65536)
-                if len(data) < 8:
+                if len(data) < 12:  # Mínimo: room_id(4) + client_id(4) + username_len(4)
                     continue
                 room_id = struct.unpack('!I', data[0:4])[0]
                 sender_id = struct.unpack('!I', data[4:8])[0]
+                username_len = struct.unpack('!I', data[8:12])[0]
+                
                 if room_id != self.room_id or sender_id == self.client_id:
                     continue
-                frame_data = data[8:]
+                
+                if len(data) < 12 + username_len:
+                    continue
+                
+                # Extraer username
+                username = data[12:12+username_len].decode('utf-8', errors='ignore')
+                frame_data = data[12+username_len:]
+                
                 frame = cv2.imdecode(np.frombuffer(frame_data, np.uint8), cv2.IMREAD_COLOR)
                 if frame is not None:
                     with self.frames_lock:
                         self.remote_frames[sender_id] = frame
+                        self.remote_usernames[sender_id] = username
             except socket.timeout:
                 continue
             except Exception as e:
@@ -347,7 +363,9 @@ class VideoClient:
                     # Agregar frames remotos
                     for sender_id, frame in self.remote_frames.items():
                         frame_copy = frame.copy()
-                        cv2.putText(frame_copy, f'Usuario {sender_id}', (10, 30), 
+                        # Obtener el nombre de usuario, o usar el ID como fallback
+                        username = self.remote_usernames.get(sender_id, f'Usuario {sender_id}')
+                        cv2.putText(frame_copy, username, (10, 30), 
                                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
                         all_frames.append((f'User{sender_id}', frame_copy))
                 
@@ -524,7 +542,7 @@ def main() -> None:
                             video_client = None
                             video_client_ref[0] = None
                             print('[VIDEO] Notificando a otros usuarios que terminaste la videollamada')
-                        video_client = VideoClient(args.host, MEDIA_PORT, room_id, client_id, stop_callback)
+                        video_client = VideoClient(args.host, MEDIA_PORT, room_id, client_id, chat.username, stop_callback)
                         video_client_ref[0] = video_client
                         if video_client.start():
                             chat.send_call_action('start')

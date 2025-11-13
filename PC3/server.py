@@ -275,10 +275,12 @@ class UdpVideoRelay:
         while True:
             try:
                 data, addr = self.sock.recvfrom(65536)
-                if len(data) < 8:
+                # Verificar que tenga al menos el header básico (room_id + client_id + username_len)
+                if len(data) < 12:
                     continue
                 
                 room_id = struct.unpack('!I', data[0:4])[0]
+                client_id = struct.unpack('!I', data[4:8])[0]
                 
                 with self.rooms_lock:
                     if room_id not in self.rooms:
@@ -286,12 +288,13 @@ class UdpVideoRelay:
                     self.rooms[room_id].add(addr)
                     destinations = [a for a in self.rooms[room_id] if a != addr]
                 
-                # Reenviar a todos los demás en la sala
-                for dest in destinations:
-                    try:
-                        self.sock.sendto(data, dest)
-                    except Exception:
-                        pass
+                # Reenviar a todos los demás en la sala (el paquete ya incluye el username)
+                if destinations:
+                    for dest in destinations:
+                        try:
+                            self.sock.sendto(data, dest)
+                        except Exception:
+                            pass
             except Exception:
                 pass
 
