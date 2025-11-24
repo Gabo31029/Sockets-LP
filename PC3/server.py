@@ -19,6 +19,7 @@ FILE_HOST = '0.0.0.0'
 FILE_PORT = 9010
 MEDIA_HOST = '0.0.0.0'
 MEDIA_PORT = 9020
+AUDIO_PORT = 9030
 
 SERVER_STORAGE_DIR = os.path.join(os.path.dirname(__file__), 'server_storage')
 os.makedirs(SERVER_STORAGE_DIR, exist_ok=True)
@@ -256,9 +257,10 @@ class UdpVideoRelay:
     Patrón: Facade - Simplifica el relay de video
     """
     
-    def __init__(self, host: str, port: int):
+    def __init__(self, host: str, port: int, service_name: str = 'MEDIA'):
         self.host = host
         self.port = port
+        self.service_name = service_name
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.rooms_lock = threading.Lock()
         self.rooms: Dict[int, set] = {}  # room_id -> set of addresses
@@ -266,7 +268,7 @@ class UdpVideoRelay:
     def start(self) -> None:
         """Inicia el relay UDP"""
         self.sock.bind((self.host, self.port))
-        print(f'[MEDIA] UDP relay on {self.host}:{self.port}')
+        print(f'[{self.service_name}] UDP relay on {self.host}:{self.port}')
         threading.Thread(target=self._recv_loop, daemon=True).start()
     
     def _recv_loop(self) -> None:
@@ -342,12 +344,14 @@ def main() -> None:
     # Factory: crear servidores
     chat_server = ChatServer(CHAT_HOST, CHAT_PORT, db)
     file_server = FileServer(FILE_HOST, FILE_PORT)
-    media_relay = UdpVideoRelay(MEDIA_HOST, MEDIA_PORT)
+    media_relay = UdpVideoRelay(MEDIA_HOST, MEDIA_PORT, service_name='VIDEO')
+    audio_relay = UdpVideoRelay(MEDIA_HOST, AUDIO_PORT, service_name='AUDIO')
     
     # Iniciar todos los servicios
     chat_server.start()
     file_server.start()
     media_relay.start()
+    audio_relay.start()
     
     local_ip = get_local_ip()
     print('[SERVER] All services started. Press Ctrl+C to stop.')
@@ -357,6 +361,7 @@ def main() -> None:
     print(f'[SERVER]   - TCP {CHAT_PORT} (Chat)')
     print(f'[SERVER]   - TCP {FILE_PORT} (Archivos)')
     print(f'[SERVER]   - UDP {MEDIA_PORT} (Video)')
+    print(f'[SERVER]   - UDP {AUDIO_PORT} (Audio)')
     
     try:
         while True:

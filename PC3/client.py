@@ -11,6 +11,8 @@ import argparse
 import struct
 import time
 import numpy as np
+import queue
+import sounddevice as sd
 import getpass
 from typing import Optional, Dict, Tuple, Callable
 from tkinter import filedialog
@@ -24,6 +26,7 @@ FILE_HOST = '127.0.0.1'
 FILE_PORT = 9010
 MEDIA_HOST = '127.0.0.1'
 MEDIA_PORT = 9020
+AUDIO_PORT = 9030
 
 DOWNLOADS_DIR = os.path.join(os.path.dirname(__file__), 'downloads')
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
@@ -254,14 +257,21 @@ class VideoClient:
     Patrón: Facade - Simplifica el manejo de video
     Patrón: Observer - Callback para notificar eventos
     """
+    AUDIO_SAMPLE_RATE = 16000
+    AUDIO_CHANNELS = 1
+    AUDIO_FRAME_DURATION = 0.02  # 20 ms por bloque
+    AUDIO_QUEUE_SIZE = 50
     def __init__(self, host: str, port: int, room_id: int, client_id: int, 
-                 username: str, on_stop_callback: Optional[Callable] = None) -> None:
+                 username: str, on_stop_callback: Optional[Callable] = None,
+                 audio_port: Optional[int] = None) -> None:
         self.host = host
         self.port = port
         self.room_id = room_id
         self.client_id = client_id
         self.username = username
+        self.audio_port = audio_port
         self.sock: Optional[socket.socket] = None
+        self.audio_sock: Optional[socket.socket] = None
         self.running = False
         self.cap: Optional[cv2.VideoCapture] = None
         self.remote_frames: Dict[int, np.ndarray] = {}  # sender_id -> frame
@@ -269,11 +279,19 @@ class VideoClient:
         self.local_frame: Optional[np.ndarray] = None
         self.frames_lock = threading.Lock()
         self.on_stop_callback = on_stop_callback
+        self.audio_input_stream: Optional[sd.InputStream] = None
+        self.audio_output_stream: Optional[sd.OutputStream] = None
+        self.audio_queue: queue.Queue = queue.Queue(maxsize=self.AUDIO_QUEUE_SIZE)
+        self.audio_chunk_frames = int(self.AUDIO_SAMPLE_RATE * self.AUDIO_FRAME_DURATION)
+        self._username_bytes = self.username.encode('utf-8')
 
     def start(self) -> bool:
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.sock.settimeout(0.1)  # Timeout para no bloquear indefinidamente
+            if self.audio_port:
+                self.audio_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                self.audio_sock.settimeout(0.1)
             self.cap = cv2.VideoCapture(0)
             if not self.cap.isOpened():
                 print('[ERROR] No se pudo abrir la cámara')
@@ -282,7 +300,10 @@ class VideoClient:
             threading.Thread(target=self._send_loop, daemon=True).start()
             threading.Thread(target=self._recv_loop, daemon=True).start()
             threading.Thread(target=self._display_loop, daemon=True).start()
-            print('[VIDEO] Cámara iniciada, enviando video...')
+            if self.audio_port and not self._start_audio_components():
+                self.stop()
+                return False
+            print('[VIDEO] Cámara iniciada, enviando video y audio...')
             return True
         except Exception as e:
             print(f'[ERROR] Error al iniciar video: {e}')
@@ -371,30 +392,40 @@ class VideoClient:
                 
                 # Crear grid de videos
                 if all_frames:
-                    frame_height, frame_width = all_frames[0][1].shape[:2]
+                    # Tamaño estándar para todos los frames (ajustable según necesidad)
+                    STANDARD_HEIGHT = 360
+                    STANDARD_WIDTH = 640
+                    
+                    # Redimensionar todos los frames al tamaño estándar
+                    resized_frames = []
+                    for name, frame in all_frames:
+                        resized = cv2.resize(frame, (STANDARD_WIDTH, STANDARD_HEIGHT))
+                        resized_frames.append((name, resized))
+                    
+                    frame_height, frame_width = STANDARD_HEIGHT, STANDARD_WIDTH
                     black_frame = np.zeros((frame_height, frame_width, 3), dtype=np.uint8)
                     
-                    if len(all_frames) == 1:
+                    if len(resized_frames) == 1:
                         # Solo un video, mostrarlo completo
-                        combined = all_frames[0][1]
-                    elif len(all_frames) == 2:
+                        combined = resized_frames[0][1]
+                    elif len(resized_frames) == 2:
                         # Dos videos, lado a lado
-                        combined = np.hstack([all_frames[0][1], all_frames[1][1]])
-                    elif len(all_frames) == 3:
-                        # Tres videos: 2 arriba, 1 abajo centrado
-                        top_row = np.hstack([all_frames[0][1], all_frames[1][1]])
-                        bottom_row = np.hstack([black_frame, all_frames[2][1], black_frame])
+                        combined = np.hstack([resized_frames[0][1], resized_frames[1][1]])
+                    elif len(resized_frames) == 3:
+                        # Tres videos: grid 2x2 con un espacio vacío
+                        top_row = np.hstack([resized_frames[0][1], resized_frames[1][1]])
+                        bottom_row = np.hstack([resized_frames[2][1], black_frame])
                         combined = np.vstack([top_row, bottom_row])
-                    elif len(all_frames) == 4:
+                    elif len(resized_frames) == 4:
                         # Cuatro videos, grid 2x2
-                        top_row = np.hstack([all_frames[0][1], all_frames[1][1]])
-                        bottom_row = np.hstack([all_frames[2][1], all_frames[3][1]])
+                        top_row = np.hstack([resized_frames[0][1], resized_frames[1][1]])
+                        bottom_row = np.hstack([resized_frames[2][1], resized_frames[3][1]])
                         combined = np.vstack([top_row, bottom_row])
                     else:
                         # Más de 4 videos, grid 3x3 (máximo 9)
                         rows = []
-                        for i in range(0, min(len(all_frames), 9), 3):
-                            row_frames = [all_frames[j][1] for j in range(i, min(i+3, len(all_frames)))]
+                        for i in range(0, min(len(resized_frames), 9), 3):
+                            row_frames = [resized_frames[j][1] for j in range(i, min(i+3, len(resized_frames)))]
                             while len(row_frames) < 3:
                                 row_frames.append(black_frame)
                             rows.append(np.hstack(row_frames))
@@ -418,12 +449,145 @@ class VideoClient:
                     print(f'[VIDEO] Error en display: {e}')
                 break
 
+    def _start_audio_components(self) -> bool:
+        """Inicializa captura, reproducción y sockets de audio bidireccional"""
+        try:
+            if not self.audio_sock:
+                print('[AUDIO] No se configuró un puerto de audio')
+                return False
+            self.audio_input_stream = sd.InputStream(
+                samplerate=self.AUDIO_SAMPLE_RATE,
+                channels=self.AUDIO_CHANNELS,
+                dtype='float32',
+                blocksize=self.audio_chunk_frames
+            )
+            self.audio_output_stream = sd.OutputStream(
+                samplerate=self.AUDIO_SAMPLE_RATE,
+                channels=self.AUDIO_CHANNELS,
+                dtype='float32',
+                blocksize=self.audio_chunk_frames,
+                callback=self._audio_playback_callback
+            )
+            self.audio_input_stream.start()
+            self.audio_output_stream.start()
+            threading.Thread(target=self._audio_send_loop, daemon=True).start()
+            threading.Thread(target=self._audio_recv_loop, daemon=True).start()
+            print('[AUDIO] Captura y reproducción de audio activadas')
+            return True
+        except Exception as e:
+            print(f'[ERROR] No se pudo iniciar el audio: {e}')
+            return False
+
+    def _audio_send_loop(self) -> None:
+        """Captura audio del micrófono y lo envía por UDP"""
+        if not self.audio_input_stream or not self.audio_sock:
+            return
+        username_len = len(self._username_bytes)
+        while self.running:
+            try:
+                data, overflowed = self.audio_input_stream.read(self.audio_chunk_frames)
+                if overflowed:
+                    print('[AUDIO] Overflow en captura de audio')
+                payload = np.asarray(data, dtype=np.float32).tobytes()
+                packet = (
+                    struct.pack('!III', self.room_id, self.client_id, username_len) +
+                    self._username_bytes +
+                    payload
+                )
+                self.audio_sock.sendto(packet, (self.host, self.audio_port))
+            except sd.PortAudioError as e:
+                if self.running:
+                    print(f'[AUDIO] Error de captura: {e}')
+                break
+            except Exception as e:
+                if self.running:
+                    print(f'[AUDIO] Error en envío: {e}')
+                break
+
+    def _audio_recv_loop(self) -> None:
+        """Recibe audio remoto y lo agrega a la cola de reproducción"""
+        if not self.audio_sock:
+            return
+        while self.running:
+            try:
+                data, _ = self.audio_sock.recvfrom(32768)
+                if len(data) < 12:
+                    continue
+                room_id = struct.unpack('!I', data[0:4])[0]
+                sender_id = struct.unpack('!I', data[4:8])[0]
+                username_len = struct.unpack('!I', data[8:12])[0]
+                if room_id != self.room_id or sender_id == self.client_id:
+                    continue
+                if len(data) < 12 + username_len:
+                    continue
+                audio_bytes = data[12+username_len:]
+                if not audio_bytes:
+                    continue
+                samples = np.frombuffer(audio_bytes, dtype=np.float32)
+                if samples.size == 0:
+                    continue
+                try:
+                    samples = samples.reshape((-1, self.AUDIO_CHANNELS))
+                except ValueError:
+                    continue
+                try:
+                    self.audio_queue.put_nowait(samples)
+                except queue.Full:
+                    # Descartar audio si el buffer está lleno para evitar latencia acumulada
+                    pass
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if self.running:
+                    print(f'[AUDIO] Error en recepción: {e}')
+                break
+
+    def _audio_playback_callback(self, outdata, frames, _time_info, status) -> None:
+        """Callback de reproducción: obtiene audio de la cola y lo envía a los parlantes"""
+        if status:
+            print(f'[AUDIO] Estado de reproducción: {status}')
+        if not self.running:
+            outdata.fill(0)
+            return
+        try:
+            chunk = self.audio_queue.get_nowait()
+        except queue.Empty:
+            outdata.fill(0)
+            return
+        if chunk.shape[0] < frames:
+            pad = np.zeros((frames - chunk.shape[0], self.AUDIO_CHANNELS), dtype=np.float32)
+            chunk = np.vstack((chunk, pad))
+        elif chunk.shape[0] > frames:
+            chunk = chunk[:frames]
+        outdata[:] = chunk
+
     def stop(self) -> None:
         self.running = False
         if self.cap:
             self.cap.release()
         if self.sock:
             self.sock.close()
+        if self.audio_sock:
+            self.audio_sock.close()
+        if self.audio_input_stream:
+            try:
+                self.audio_input_stream.stop()
+                self.audio_input_stream.close()
+            except Exception:
+                pass
+            self.audio_input_stream = None
+        if self.audio_output_stream:
+            try:
+                self.audio_output_stream.stop()
+                self.audio_output_stream.close()
+            except Exception:
+                pass
+            self.audio_output_stream = None
+        while not self.audio_queue.empty():
+            try:
+                self.audio_queue.get_nowait()
+            except queue.Empty:
+                break
         cv2.destroyAllWindows()
         print('[VIDEO] Videollamada detenida')
 
@@ -542,7 +706,15 @@ def main() -> None:
                             video_client = None
                             video_client_ref[0] = None
                             print('[VIDEO] Notificando a otros usuarios que terminaste la videollamada')
-                        video_client = VideoClient(args.host, MEDIA_PORT, room_id, client_id, chat.username, stop_callback)
+                        video_client = VideoClient(
+                            args.host,
+                            MEDIA_PORT,
+                            room_id,
+                            client_id,
+                            chat.username,
+                            stop_callback,
+                            audio_port=AUDIO_PORT
+                        )
                         video_client_ref[0] = video_client
                         if video_client.start():
                             chat.send_call_action('start')
