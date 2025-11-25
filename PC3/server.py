@@ -6,6 +6,8 @@ Patrón: Factory - Crea handlers para diferentes tipos de servicios
 import os
 import socket
 import threading
+import json
+import struct
 from typing import Dict, List, Tuple, Optional
 from database import Database
 from protocol import ProtocolHandler
@@ -82,11 +84,59 @@ class ChatServer(BaseServer):
         username = None
         try:
             # Autenticación
-            auth_msg = ProtocolHandler.recv_json(client_sock)
-            success, username = self.auth_handler.handle_auth(auth_msg, client_sock)
+            try:
+                auth_msg = ProtocolHandler.recv_json(client_sock)
+            except (ConnectionError, OSError, json.JSONDecodeError, struct.error) as e:
+                print(f'[CHAT] Error al recibir mensaje de autenticación de {addr}: {e}')
+                try:
+                    # Intentar enviar mensaje de error antes de cerrar
+                    ProtocolHandler.send_json(client_sock, {
+                        'type': 'auth_response',
+                        'success': False,
+                        'message': 'Error de protocolo: formato de mensaje inválido'
+                    })
+                except:
+                    pass
+                client_sock.close()
+                return
+            
+            if not auth_msg or 'type' not in auth_msg:
+                print(f'[CHAT] Mensaje de autenticación inválido de {addr}')
+                try:
+                    ProtocolHandler.send_json(client_sock, {
+                        'type': 'auth_response',
+                        'success': False,
+                        'message': 'Mensaje de autenticación inválido'
+                    })
+                except:
+                    pass
+                client_sock.close()
+                return
+            
+            try:
+                success, username = self.auth_handler.handle_auth(auth_msg, client_sock)
+            except Exception as e:
+                print(f'[CHAT] Error al procesar autenticación de {addr}: {e}')
+                try:
+                    ProtocolHandler.send_json(client_sock, {
+                        'type': 'auth_response',
+                        'success': False,
+                        'message': f'Error interno del servidor: {str(e)}'
+                    })
+                except:
+                    pass
+                client_sock.close()
+                return
             
             if not success or not username:
-                client_sock.close()
+                # El handler ya envió la respuesta
+                # Dar un pequeño tiempo para que el cliente lea la respuesta antes de cerrar
+                import time
+                time.sleep(0.1)  # 100ms para que el cliente pueda leer la respuesta
+                try:
+                    client_sock.close()
+                except:
+                    pass
                 return
             
             # Registrar cliente (Observer pattern: agregar observador)
@@ -306,33 +356,69 @@ def get_local_ip() -> str:
     """
     Obtiene la IP local de la máquina usando solo sockets
     Intenta obtener la IP de la interfaz de red activa
+    Prioriza IPs privadas (192.168.x.x, 10.x.x.x, 172.16-31.x.x)
     """
+    import ipaddress
+    
+    def is_private_ip(ip_str: str) -> bool:
+        """Verifica si una IP es privada (rango local)"""
+        try:
+            ip = ipaddress.ip_address(ip_str)
+            return ip.is_private
+        except:
+            return False
+    
+    def is_valid_network_ip(ip_str: str) -> bool:
+        """Verifica si una IP es válida para conexiones de red (no localhost, no virtual)"""
+        if not ip_str or ip_str.startswith("127.") or ip_str == "0.0.0.0":
+            return False
+        # Filtrar IPs comunes de interfaces virtuales
+        if ip_str.startswith("169.254."):  # Link-local
+            return False
+        return True
+    
+    # Método 1: Intentar conectar a un servidor externo para obtener IP de salida
     try:
-        # Crear un socket UDP sin conectar (solo sockets locales)
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        # Intentar conectar a una IP local (no hace conexión real, solo configura la ruta)
-        # Usamos una IP de loopback alternativa para evitar conexión externa
+        s.connect(("8.8.8.8", 80))  # Google DNS, no hace conexión real
+        ip = s.getsockname()[0]
+        s.close()
+        if is_valid_network_ip(ip):
+            return ip
+    except Exception:
+        pass
+    
+    # Método 2: Obtener todas las IPs del hostname
+    try:
+        hostname = socket.gethostname()
+        # Obtener todas las IPs asociadas al hostname
+        ip_list = socket.gethostbyname_ex(hostname)[2]
+        
+        # Priorizar IPs privadas
+        private_ips = [ip for ip in ip_list if is_private_ip(ip) and is_valid_network_ip(ip)]
+        if private_ips:
+            return private_ips[0]  # Devolver la primera IP privada
+        
+        # Si no hay privadas, devolver la primera válida
+        valid_ips = [ip for ip in ip_list if is_valid_network_ip(ip)]
+        if valid_ips:
+            return valid_ips[0]
+    except Exception:
+        pass
+    
+    # Método 3: Fallback - intentar obtener IP de interfaz activa
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("127.255.255.255", 1))
         ip = s.getsockname()[0]
         s.close()
-        # Si obtuvimos 127.0.0.1, intentar obtener el hostname
-        if ip == "127.0.0.1" or ip.startswith("127."):
-            hostname = socket.gethostname()
-            ip = socket.gethostbyname(hostname)
-            # Si aún es localhost, devolver 0.0.0.0 como fallback
-            if ip == "127.0.0.1" or ip.startswith("127."):
-                return "0.0.0.0"
-        return ip
+        if is_valid_network_ip(ip):
+            return ip
     except Exception:
-        # Fallback: intentar obtener IP del hostname
-        try:
-            hostname = socket.gethostname()
-            ip = socket.gethostbyname(hostname)
-            if ip != "127.0.0.1" and not ip.startswith("127."):
-                return ip
-        except Exception:
-            pass
-        return "127.0.0.1"
+        pass
+    
+    # Si todo falla, devolver 0.0.0.0 para que el servidor escuche en todas las interfaces
+    return "0.0.0.0"
 
 
 def main() -> None:
@@ -360,6 +446,19 @@ def main() -> None:
     print('[SERVER] All services started. Press Ctrl+C to stop.')
     print(f'[SERVER] Para conectarte desde otra máquina, usa esta IP: {local_ip}')
     print(f'[SERVER] Ejemplo: python client.py --host {local_ip}')
+    
+    # Mostrar todas las IPs disponibles para ayudar a diagnosticar
+    try:
+        import ipaddress
+        hostname = socket.gethostname()
+        all_ips = socket.gethostbyname_ex(hostname)[2]
+        valid_ips = [ip for ip in all_ips if not ip.startswith("127.") and ip != "0.0.0.0"]
+        if len(valid_ips) > 1:
+            print(f'[SERVER] IPs disponibles en esta máquina: {", ".join(valid_ips)}')
+            print(f'[SERVER] Si {local_ip} no funciona, prueba con las otras IPs mostradas arriba')
+    except Exception:
+        pass
+    
     print(f'[SERVER] Asegúrate de permitir estos puertos en el firewall:')
     print(f'[SERVER]   - TCP {CHAT_PORT} (Chat)')
     print(f'[SERVER]   - TCP {FILE_PORT} (Archivos)')

@@ -50,21 +50,56 @@ class ChatClient:
         Patrón: Strategy - Diferentes estrategias de autenticación
         """
         try:
+            # Asegurar que el socket tenga timeout para la autenticación
+            if self.sock:
+                self.sock.settimeout(10)
+            
+            # Enviar solicitud de autenticación
             ProtocolHandler.send_json(self.sock, {
                 'type': auth_type,
                 'username': username,
                 'password': password
             })
+            
+            # Recibir respuesta de autenticación
             response = ProtocolHandler.recv_json(self.sock)
-            if response.get('type') == 'auth_response':
-                success = response.get('success', False)
-                message = response.get('message', '')
-                if success:
+            if not response or response.get('type') != 'auth_response':
+                return False, 'Respuesta inválida del servidor'
+            
+            success = response.get('success', False)
+            message = response.get('message', '')
+            
+            # Solo leer el segundo mensaje si la autenticación fue exitosa
+            if success:
+                try:
                     success_msg = ProtocolHandler.recv_json(self.sock)
-                    if success_msg.get('type') == 'auth_success':
+                    if success_msg and success_msg.get('type') == 'auth_success':
                         self.username = success_msg.get('username', username)
-                return success, message
-            return False, 'Respuesta inválida del servidor'
+                    else:
+                        # Si el segundo mensaje no es el esperado, aún consideramos éxito
+                        # pero usamos el username original
+                        self.username = username
+                    # Quitar timeout después de autenticación exitosa
+                    if self.sock:
+                        self.sock.settimeout(None)
+                except (ConnectionError, OSError) as e:
+                    # Si hay error al leer el segundo mensaje, pero success=True,
+                    # asumimos que la conexión se perdió después de la autenticación
+                    return False, f'Error al confirmar autenticación: {e}'
+            else:
+                # Si falla, el servidor cerrará el socket, así que no quitamos el timeout
+                # pero esperamos un momento para que el servidor cierre correctamente
+                pass
+            
+            return success, message
+            
+        except socket.timeout:
+            return False, 'Timeout: El servidor no respondió a tiempo'
+        except (ConnectionError, OSError) as e:
+            error_str = str(e)
+            if 'Connection closed' in error_str or '10054' in error_str:
+                return False, 'El servidor cerró la conexión. Verifica tus credenciales.'
+            return False, f'Error de conexión durante autenticación: {e}'
         except Exception as e:
             return False, f'Error de autenticación: {e}'
     
@@ -84,10 +119,10 @@ class ChatClient:
                 return False
             
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.settimeout(5)  # Timeout de 5 segundos
+            self.sock.settimeout(10)  # Timeout de 10 segundos para conexión
             print(f'[CLIENTE] Intentando conectar a {self.host}:{self.port}...')
             self.sock.connect((self.host, self.port))
-            self.sock.settimeout(None)  # Quitar timeout después de conectar
+            self.sock.settimeout(10)  # Mantener timeout para autenticación
             return True
         except socket.timeout:
             print(f'[ERROR] Timeout: No se pudo conectar a {self.host}:{self.port}')
@@ -103,9 +138,20 @@ class ChatClient:
             print(f'  2. El firewall permita conexiones en el puerto {self.port}')
             print(f'  3. Ejecuta configurar_firewall.ps1 en el servidor')
             return False
-        except Exception as e:
+        except OSError as e:
             error_msg = str(e)
-            if 'getaddrinfo failed' in error_msg or '11001' in error_msg:
+            error_code = getattr(e, 'winerror', None) or getattr(e, 'errno', None)
+            
+            # Error 10051: Network is unreachable
+            if '10051' in str(error_code) or 'Network is unreachable' in error_msg or 'Host de destino inaccesible' in error_msg:
+                print(f'[ERROR] No se puede alcanzar el servidor en {self.host}:{self.port}')
+                print(f'[AYUDA] Verifica que:')
+                print(f'  1. El servidor esté ejecutándose')
+                print(f'  2. La IP sea correcta (el servidor muestra la IP al iniciar)')
+                print(f'  3. Estés en la misma red que el servidor')
+                print(f'  4. Si el servidor muestra varias IPs, prueba con cada una')
+                print(f'  5. Ejemplo: python client.py --host 192.168.1.100')
+            elif 'getaddrinfo failed' in error_msg or '11001' in str(error_code):
                 print(f'[ERROR] No se pudo resolver el host "{self.host}"')
                 print(f'[AYUDA] Verifica que:')
                 print(f'  1. La IP sea correcta (ejemplo: 192.168.1.100)')
@@ -113,6 +159,11 @@ class ChatClient:
                 print(f'  3. El servidor muestre la IP al iniciar')
             else:
                 print(f'[ERROR] No se pudo conectar al servidor: {e}')
+                print(f'[AYUDA] Verifica que el servidor esté ejecutándose y la IP sea correcta')
+            return False
+        except Exception as e:
+            print(f'[ERROR] Error inesperado: {e}')
+            print(f'[AYUDA] Verifica que el servidor esté ejecutándose y la IP sea correcta')
             return False
 
     def _recv_loop(self) -> None:
@@ -1122,7 +1173,10 @@ class ChatGUI:
             # Conectar
             chat = ChatClient(host, CHAT_PORT, '')
             if not chat.connect():
-                status_label.config(text="Error: No se pudo conectar al servidor", foreground="red")
+                status_label.config(
+                    text="Error: No se pudo conectar al servidor.\nVerifica la IP y que el servidor esté ejecutándose.", 
+                    foreground="red"
+                )
                 return
             
             # Autenticar
