@@ -753,6 +753,10 @@ class ChatGUI:
         self.audio_messages: Dict[str, Dict] = {}  # file_id -> metadata
         self.audio_message_frames: list = []
         self.audio_playback_thread: Optional[threading.Thread] = None
+        self.file_messages: Dict[str, Dict] = {}  # file_id -> metadata
+        self.file_message_frames: list = []
+        self.file_messages: Dict[str, Dict] = {}  # file_id -> metadata
+        self.file_message_frames: list = []
         
         # Crear interfaz
         self._create_widgets()
@@ -851,7 +855,10 @@ class ChatGUI:
             insertbackground=self.colors['fg_main']
         )
         self.chat_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        self.chat_text.bind("<Configure>", self._resize_audio_bubbles)
+        def on_chat_resize(event):
+            self._resize_audio_bubbles(event)
+            self._resize_file_bubbles(event)
+        self.chat_text.bind("<Configure>", on_chat_resize)
         
         # Configurar tags de color para mensajes
         self.chat_text.tag_config("system", foreground=self.colors['info'], font=('Segoe UI', 10, 'italic'))
@@ -1239,9 +1246,10 @@ class ChatGUI:
                     from_user = msg.get('from')
                     filename = msg.get('filename')
                     file_id = msg.get('file_id')
+                    size = msg.get('size', 0)
                     self.available_files[file_id] = {'filename': filename, 'from': from_user}
-                    info = f"{from_user} compartió: {filename} (ID: {file_id})"
-                    self.root.after(0, lambda text=info: self._add_message("SISTEMA", text, "file"))
+                    self.root.after(0, lambda u=from_user, fid=file_id, fn=filename, s=size:
+                                    self._add_file_message(u, fid, fn, s))
                 elif mtype == 'call':
                     action = msg.get('action')
                     from_user = msg.get('from')
@@ -1319,13 +1327,13 @@ class ChatGUI:
         self.audio_messages[file_id] = meta
         
         self.chat_text.config(state=tk.NORMAL)
-        container_height = 50
-        container = tk.Frame(self.chat_text, bg=self.colors['bg_secondary'], padx=8, pady=6, height=container_height)
+        container_height = 45
+        container = tk.Frame(self.chat_text, bg=self.colors['bg_secondary'], padx=8, pady=5, height=container_height)
         container.grid_propagate(False)
         container.columnconfigure(0, weight=1)
         container.columnconfigure(1, weight=0)
         
-        info_frame = tk.Frame(container, bg=self.colors['bg_secondary'], height=container_height-12)
+        info_frame = tk.Frame(container, bg=self.colors['bg_secondary'], height=container_height-10)
         info_frame.grid(row=0, column=0, sticky=(tk.W, tk.E))
         info_frame.grid_propagate(False)
         info_frame.columnconfigure(1, weight=1)
@@ -1366,7 +1374,7 @@ class ChatGUI:
         play_btn.grid(row=0, column=1, sticky=tk.E, padx=(10, 0))
         
         self.chat_text.window_create(tk.END, window=container)
-        self.chat_text.insert(tk.END, "\n")
+        self.chat_text.insert(tk.END, "\n\n")
         self.chat_text.config(state=tk.DISABLED)
         self.chat_text.see(tk.END)
         self.audio_message_frames.append({
@@ -1381,7 +1389,8 @@ class ChatGUI:
         """Ajusta el ancho de las burbujas de audio según el tamaño del chat"""
         if not self.audio_message_frames:
             return
-        available_width = max(160, self.chat_text.winfo_width() - 20)
+        MAX_WIDTH = 450  # Ancho máximo para los bloques de audio
+        available_width = max(160, min(MAX_WIDTH, self.chat_text.winfo_width() - 20))
         for item in self.audio_message_frames:
             frame = item.get('frame')
             info = item.get('info')
@@ -1394,6 +1403,138 @@ class ChatGUI:
                     info.grid_propagate(False)
             except Exception:
                 pass
+
+    def _add_file_message(self, user: str, file_id: str, filename: str, size: int):
+        """Inserta un mensaje de archivo con un botón de descarga"""
+        if file_id in self.file_messages and self.file_messages[file_id].get('rendered'):
+            # Ya fue agregado, no duplicar
+            return
+        
+        local_path = os.path.join(DOWNLOADS_DIR, filename)
+        meta = self.file_messages.get(file_id, {})
+        meta.update({
+            'filename': filename,
+            'size': size,
+            'local_path': local_path if os.path.exists(local_path) else meta.get('local_path'),
+            'downloading': False,
+            'rendered': True
+        })
+        self.file_messages[file_id] = meta
+        
+        self.chat_text.config(state=tk.NORMAL)
+        container_height = 45
+        container = tk.Frame(self.chat_text, bg=self.colors['bg_secondary'], padx=8, pady=5, height=container_height)
+        container.grid_propagate(False)
+        container.columnconfigure(0, weight=1)
+        container.columnconfigure(1, weight=0)
+        
+        info_frame = tk.Frame(container, bg=self.colors['bg_secondary'], height=container_height-10)
+        info_frame.grid(row=0, column=0, sticky=(tk.W, tk.E))
+        info_frame.grid_propagate(False)
+        info_frame.columnconfigure(1, weight=1)
+        
+        icon_label = tk.Label(
+            info_frame,
+            text="📄",
+            bg=self.colors['bg_secondary'],
+            fg=self.colors['fg_main'],
+            font=('Segoe UI', 12, 'bold')
+        )
+        icon_label.grid(row=0, column=0, sticky=tk.W, padx=(0, 5))
+        
+        size_str = self._format_file_size(size) if size > 0 else ""
+        text_label = tk.Label(
+            info_frame,
+            text=f"[{user}] · {filename}" + (f" · {size_str}" if size_str else ""),
+            bg=self.colors['bg_secondary'],
+            fg=self.colors['fg_main'],
+            font=('Segoe UI', 10, 'bold'),
+            anchor='w'
+        )
+        text_label.grid(row=0, column=1, sticky=(tk.W, tk.E))
+        
+        download_btn = tk.Button(
+            container,
+            text="⬇️ Descargar",
+            command=lambda fid=file_id: self.download_file_message(fid),
+            bg=self.colors['bg_button'],
+            fg='white',
+            font=('Segoe UI', 9, 'bold'),
+            relief=tk.FLAT,
+            bd=0,
+            padx=12,
+            cursor='hand2',
+            activebackground=self.colors['bg_button_hover'],
+            activeforeground='white'
+        )
+        download_btn.grid(row=0, column=1, sticky=tk.E, padx=(10, 0))
+        
+        self.chat_text.window_create(tk.END, window=container)
+        self.chat_text.insert(tk.END, "\n\n")
+        self.chat_text.config(state=tk.DISABLED)
+        self.chat_text.see(tk.END)
+        self.file_message_frames.append({
+            'frame': container,
+            'info': info_frame,
+            'button': download_btn
+        })
+        self._resize_file_bubbles()
+        self.root.after_idle(self._resize_file_bubbles)
+
+    def _format_file_size(self, size: int) -> str:
+        """Formatea el tamaño del archivo en formato legible"""
+        for unit in ['B', 'KB', 'MB', 'GB']:
+            if size < 1024.0:
+                return f"{size:.1f} {unit}"
+            size /= 1024.0
+        return f"{size:.1f} TB"
+
+    def _resize_file_bubbles(self, event=None):
+        """Ajusta el ancho de las burbujas de archivo según el tamaño del chat"""
+        if not self.file_message_frames:
+            return
+        MAX_WIDTH = 450  # Ancho máximo para los bloques de archivo
+        available_width = max(160, min(MAX_WIDTH, self.chat_text.winfo_width() - 20))
+        for item in self.file_message_frames:
+            frame = item.get('frame')
+            info = item.get('info')
+            button = item.get('button')
+            try:
+                frame.configure(width=available_width)
+                info_width = max(80, available_width - (button.winfo_reqwidth() + 30))
+                if info is not None:
+                    info.configure(width=info_width)
+                    info.grid_propagate(False)
+            except Exception:
+                pass
+
+    def download_file_message(self, file_id: str):
+        """Descarga (si es necesario) un archivo compartido"""
+        if file_id not in self.file_messages:
+            self._post_message("SISTEMA", "Archivo no disponible", "error")
+            return
+        meta = self.file_messages[file_id]
+        if meta.get('downloading'):
+            return
+        
+        def worker():
+            path = meta.get('local_path')
+            if not path or not os.path.exists(path):
+                meta['downloading'] = True
+                success = FileClient.download_file(self.host, FILE_PORT, file_id)
+                meta['downloading'] = False
+                if not success:
+                    self._post_message("SISTEMA", "No se pudo descargar el archivo", "error")
+                    return
+                path = os.path.join(DOWNLOADS_DIR, meta['filename'])
+                meta['local_path'] = path
+            # Abrir el archivo con el programa predeterminado
+            try:
+                os.startfile(path)
+            except Exception:
+                self._post_message("SISTEMA", f"Archivo descargado en: {path}", "system")
+        
+        threading.Thread(target=worker, daemon=True).start()
 
     def _resize_input_controls(self, event=None):
         """Mantiene tamaños proporcionales para los botones de enviar y audio"""
@@ -1731,9 +1872,11 @@ class ChatGUI:
             if file_id:
                 filename = os.path.basename(filepath)
                 size = os.path.getsize(filepath)
+                # Agregar a available_files para que aparezca en la lista de archivos
+                self.available_files[file_id] = {'filename': filename, 'from': self.username, 'size': size}
                 self.chat_client.notify_file_available(filename, size, file_id)
-                self.root.after(0, lambda: self._add_message("SISTEMA", 
-                    f"Archivo subido: {filename}", "file"))
+                # Mostrar el archivo en el chat del usuario que lo subió
+                self.root.after(0, lambda: self._add_file_message(self.username, file_id, filename, size))
             else:
                 self.root.after(0, lambda: messagebox.showerror("Error", 
                     "No se pudo subir el archivo"))
@@ -1741,8 +1884,28 @@ class ChatGUI:
         threading.Thread(target=upload_thread, daemon=True).start()
     
     def show_files(self):
-        """Muestra ventana de archivos disponibles"""
-        if not self.available_files:
+        """Muestra ventana de archivos disponibles (incluyendo los propios)"""
+        # Combinar archivos de otros usuarios y archivos propios
+        all_files = {}
+        
+        # Agregar archivos compartidos por otros usuarios
+        for file_id, info in self.available_files.items():
+            all_files[file_id] = {
+                'filename': info['filename'],
+                'from': info['from'],
+                'size': info.get('size', 0)
+            }
+        
+        # Agregar archivos propios (subidos por el usuario)
+        for file_id, meta in self.file_messages.items():
+            if file_id not in all_files:  # Evitar duplicados
+                all_files[file_id] = {
+                    'filename': meta['filename'],
+                    'from': self.username,
+                    'size': meta.get('size', 0)
+                }
+        
+        if not all_files:
             messagebox.showinfo("📁 Archivos", "No hay archivos disponibles")
             return
         
@@ -1778,8 +1941,26 @@ class ChatGUI:
         )
         listbox.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         
-        for file_id, info in self.available_files.items():
-            listbox.insert(tk.END, f"📄 {info['filename']} (de {info['from']}) - ID: {file_id}")
+        # Crear lista de archivos ordenados
+        file_list = []
+        for file_id, info in all_files.items():
+            size_str = self._format_file_size(info.get('size', 0)) if info.get('size', 0) > 0 else ""
+            from_user = info['from']
+            display_text = f"📄 {info['filename']}"
+            if from_user == self.username:
+                display_text += f" (Tú)"
+            else:
+                display_text += f" (de {from_user})"
+            if size_str:
+                display_text += f" · {size_str}"
+            display_text += f" - ID: {file_id}"
+            file_list.append((file_id, display_text))
+        
+        # Ordenar por nombre de archivo
+        file_list.sort(key=lambda x: x[1].lower())
+        
+        for file_id, display_text in file_list:
+            listbox.insert(tk.END, display_text)
         
         def download_selected():
             selection = listbox.curselection()
@@ -1788,12 +1969,28 @@ class ChatGUI:
                 return
             
             index = selection[0]
-            file_id = list(self.available_files.keys())[index]
+            file_id = file_list[index][0]
+            file_info = all_files[file_id]
             
             def download_thread():
+                # Si el archivo es propio y ya está descargado, abrirlo directamente
+                if file_info['from'] == self.username and file_id in self.file_messages:
+                    meta = self.file_messages[file_id]
+                    local_path = meta.get('local_path')
+                    if local_path and os.path.exists(local_path):
+                        try:
+                            os.startfile(local_path)
+                            self.root.after(0, lambda: messagebox.showinfo("✅ Éxito", 
+                                f"Archivo abierto: {file_info['filename']}"))
+                        except Exception:
+                            self.root.after(0, lambda: messagebox.showinfo("ℹ️ Info", 
+                                f"Archivo local: {local_path}"))
+                        return
+                
+                # Descargar el archivo
                 success = FileClient.download_file(self.host, FILE_PORT, file_id)
                 if success:
-                    filename = self.available_files[file_id]['filename']
+                    filename = file_info['filename']
                     self.root.after(0, lambda: messagebox.showinfo("✅ Éxito", 
                         f"Archivo descargado: {filename}\nGuardado en: {DOWNLOADS_DIR}"))
                 else:
