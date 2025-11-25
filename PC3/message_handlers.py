@@ -52,13 +52,18 @@ class FileAvailableHandler(MessageHandler):
     def handle(self, message: Dict, client_sock: socket.socket,
                username: str, clients: Dict, clients_lock) -> None:
         from server import ChatServer
-        ChatServer.broadcast_to_all(clients, clients_lock, {
-            'type': 'file_available',
-            'from': username,
-            'filename': message.get('filename'),
-            'size': message.get('size'),
-            'file_id': message.get('file_id'),
-        })
+        ChatServer.broadcast_to_all(
+            clients,
+            clients_lock,
+            {
+                'type': 'file_available',
+                'from': username,
+                'filename': message.get('filename'),
+                'size': message.get('size'),
+                'file_id': message.get('file_id'),
+            },
+            exclude=client_sock
+        )
 
 
 class CallActionHandler(MessageHandler):
@@ -77,6 +82,24 @@ class CallActionHandler(MessageHandler):
         })
 
 
+class AudioMessageHandler(MessageHandler):
+    """Handler para mensajes de audio"""
+
+    def can_handle(self, message_type: str) -> bool:
+        return message_type == 'audio_message'
+
+    def handle(self, message: Dict, client_sock: socket.socket,
+               username: str, clients: Dict, clients_lock) -> None:
+        from server import ChatServer
+        ChatServer.broadcast_to_all(clients, clients_lock, {
+            'type': 'audio_message',
+            'from': username,
+            'file_id': message.get('file_id'),
+            'filename': message.get('filename'),
+            'duration': message.get('duration'),
+        })
+
+
 class MessageHandlerFactory:
     """
     Factory para crear handlers de mensajes
@@ -86,7 +109,8 @@ class MessageHandlerFactory:
     _handlers = [
         TextMessageHandler(),
         FileAvailableHandler(),
-        CallActionHandler()
+        CallActionHandler(),
+        AudioMessageHandler(),
     ]
     
     @classmethod

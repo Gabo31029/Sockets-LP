@@ -6,7 +6,7 @@ Patrón: Factory - Crea handlers para diferentes tipos de servicios
 import os
 import socket
 import threading
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 from database import Database
 from protocol import ProtocolHandler
 from message_handlers import MessageHandlerFactory, AuthHandler
@@ -134,7 +134,8 @@ class ChatServer(BaseServer):
                 })
     
     @staticmethod
-    def broadcast_to_all(clients: Dict, clients_lock: threading.Lock, payload: Dict) -> None:
+    def broadcast_to_all(clients: Dict, clients_lock: threading.Lock, payload: Dict,
+                         exclude: Optional[socket.socket] = None) -> None:
         """
         Notifica a todos los clientes (Observer pattern)
         Patrón: Observer - Notifica a todos los observadores registrados
@@ -143,6 +144,8 @@ class ChatServer(BaseServer):
             dead_clients: List[socket.socket] = []
             for client_sock in clients.keys():
                 try:
+                    if exclude and client_sock is exclude:
+                        continue
                     ProtocolHandler.send_json(client_sock, payload)
                 except Exception:
                     dead_clients.append(client_sock)

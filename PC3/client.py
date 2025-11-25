@@ -10,6 +10,8 @@ import threading
 import argparse
 import struct
 import time
+import tempfile
+import wave
 import numpy as np
 import queue
 import sounddevice as sd
@@ -149,6 +151,19 @@ class ChatClient:
                 ProtocolHandler.send_json(self.sock, {'type': 'message', 'text': text})
             except Exception as e:
                 print(f'[ERROR] No se pudo enviar el mensaje: {e}')
+
+    def send_audio_message(self, file_id: str, filename: str, duration: float) -> None:
+        """Envía una notificación de mensaje de audio"""
+        if self.sock:
+            try:
+                ProtocolHandler.send_json(self.sock, {
+                    'type': 'audio_message',
+                    'file_id': file_id,
+                    'filename': filename,
+                    'duration': duration
+                })
+            except Exception as e:
+                print(f'[ERROR] No se pudo enviar el audio: {e}')
 
     def notify_file_available(self, filename: str, size: int, file_id: str) -> None:
         """Notifica que un archivo está disponible"""
@@ -678,9 +693,21 @@ class ChatGUI:
         self.client_id = int(time.time() * 1000) % 1000000
         self.available_files: Dict[str, Dict] = {}  # file_id -> {filename, from_user}
         self._updating_layout = False  # Bandera para evitar recursión
+        self.audio_recording = False
+        self.audio_record_stream: Optional[sd.InputStream] = None
+        self.audio_record_frames: list = []
+        self.audio_record_start = 0.0
+        self.audio_sample_rate = 16000
+        self.audio_channels = 1
+        self.audio_messages: Dict[str, Dict] = {}  # file_id -> metadata
+        self.audio_message_frames: list = []
+        self.audio_playback_thread: Optional[threading.Thread] = None
         
         # Crear interfaz
         self._create_widgets()
+        self._main_frame_visible = False
+        self.main_frame.pack_forget()
+        self.root.attributes('-alpha', 0.0)
         
         # Mostrar diálogo de conexión
         self._show_connection_dialog()
@@ -773,6 +800,7 @@ class ChatGUI:
             insertbackground=self.colors['fg_main']
         )
         self.chat_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        self.chat_text.bind("<Configure>", self._resize_audio_bubbles)
         
         # Configurar tags de color para mensajes
         self.chat_text.tag_config("system", foreground=self.colors['info'], font=('Segoe UI', 10, 'italic'))
@@ -784,7 +812,9 @@ class ChatGUI:
         self.input_frame = tk.Frame(self.chat_container, bg=self.colors['bg_secondary'])
         self.input_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), padx=10, pady=(0, 10))
         self.input_frame.columnconfigure(0, weight=1)
-        self.input_frame.columnconfigure(1, weight=0)  # Botón sin expandir
+        self.input_frame.columnconfigure(1, weight=0, minsize=56)  # Botón enviar
+        self.input_frame.columnconfigure(2, weight=0, minsize=56)  # Botón audio
+        self.input_frame.rowconfigure(0, weight=1)
         
         self.message_entry = tk.Entry(
             self.input_frame,
@@ -800,22 +830,51 @@ class ChatGUI:
         self.message_entry.bind('<FocusIn>', lambda e: self.message_entry.config(bg='#353535'))
         self.message_entry.bind('<FocusOut>', lambda e: self.message_entry.config(bg=self.colors['bg_input']))
         
-        # Botón enviar con estilo
+        # Contenedor para el botón de envío (asegura centrado y tamaño mínimo)
+        self.send_btn_container = tk.Frame(self.input_frame, bg=self.colors['bg_secondary'])
+        self.send_btn_container.grid(row=0, column=1, sticky=(tk.N, tk.S, tk.E, tk.W), padx=(5, 0))
+        self.send_btn_container.rowconfigure(0, weight=1)
+        self.send_btn_container.columnconfigure(0, weight=1)
+        
         self.send_btn = tk.Button(
-            self.input_frame,
+            self.send_btn_container,
             text="➤",
             command=self.send_message,
             bg=self.colors['bg_button'],
             fg='white',
-            font=('Segoe UI', 12, 'bold'),
+            font=('Segoe UI', 14, 'bold'),
             relief=tk.FLAT,
             bd=0,
-            padx=10,
+            anchor=tk.CENTER,
             cursor='hand2',
             activebackground=self.colors['bg_button_hover'],
             activeforeground='white'
         )
-        self.send_btn.grid(row=0, column=1, sticky=(tk.W, tk.E))
+        self.send_btn.grid(row=0, column=0, sticky=(tk.N, tk.S, tk.E, tk.W))
+
+        # Botón para grabar audio (estilo WhatsApp)
+        # Contenedor para el botón de audio (permite centrar el icono)
+        self.audio_btn_container = tk.Frame(self.input_frame, bg=self.colors['bg_secondary'])
+        self.audio_btn_container.grid(row=0, column=2, sticky=(tk.N, tk.S, tk.E, tk.W), padx=(5, 0))
+        self.audio_btn_container.rowconfigure(0, weight=1)
+        self.audio_btn_container.columnconfigure(0, weight=1)
+
+        self.audio_btn = tk.Button(
+            self.audio_btn_container,
+            text="🎙️",
+            command=self.toggle_audio_recording,
+            bg=self.colors['bg_button'],
+            fg='white',
+            font=('Segoe UI', 16, 'bold'),
+            relief=tk.FLAT,
+            bd=0,
+            anchor=tk.CENTER,
+            cursor='hand2',
+            activebackground=self.colors['bg_button_hover'],
+            activeforeground='white'
+        )
+        self.audio_btn.pack(expand=True, fill=tk.BOTH)
+        self.input_frame.bind("<Configure>", self._resize_input_controls)
         
         # Frame de botones (abajo, centrado)
         self.buttons_frame = tk.Frame(self.chat_container, bg=self.colors['bg_secondary'])
@@ -909,6 +968,7 @@ class ChatGUI:
         dialog.grab_set()
         dialog.resizable(False, False)
         dialog.configure(bg=self.colors['bg_main'])
+        dialog.protocol("WM_DELETE_WINDOW", self.root.destroy)
         
         # Centrar ventana
         dialog.update_idletasks()
@@ -940,6 +1000,8 @@ class ChatGUI:
         )
         host_label.pack(fill=tk.X, pady=(0, 5))
         
+        entry_width = 30
+        
         host_entry = tk.Entry(
             frame,
             bg=self.colors['bg_input'],
@@ -947,7 +1009,8 @@ class ChatGUI:
             font=('Segoe UI', 11),
             relief=tk.FLAT,
             bd=5,
-            insertbackground=self.colors['fg_main']
+            insertbackground=self.colors['fg_main'],
+            width=entry_width
         )
         host_entry.insert(0, self.host)
         host_entry.pack(fill=tk.X, pady=(0, 15), ipady=8)
@@ -1004,7 +1067,8 @@ class ChatGUI:
             font=('Segoe UI', 11),
             relief=tk.FLAT,
             bd=5,
-            insertbackground=self.colors['fg_main']
+            insertbackground=self.colors['fg_main'],
+            width=entry_width
         )
         user_entry.pack(fill=tk.X, pady=(0, 15), ipady=8)
         user_entry.focus()
@@ -1028,7 +1092,8 @@ class ChatGUI:
             relief=tk.FLAT,
             bd=5,
             show="*",
-            insertbackground=self.colors['fg_main']
+            insertbackground=self.colors['fg_main'],
+            width=entry_width
         )
         pass_entry.pack(fill=tk.X, pady=(0, 20), ipady=8)
         
@@ -1076,6 +1141,10 @@ class ChatGUI:
             
             self.root.title(f"💬 Chat - {self.username}")
             dialog.destroy()
+            if not self._main_frame_visible:
+                self.main_frame.pack(fill=tk.BOTH, expand=True)
+                self._main_frame_visible = True
+            self.root.attributes('-alpha', 1.0)
             self._add_message("SISTEMA", f"✅ Conectado como {self.username}", "system")
         
         connect_btn = tk.Button(
@@ -1108,28 +1177,38 @@ class ChatGUI:
                 if mtype == 'message':
                     from_user = msg.get('from', 'unknown')
                     text = msg.get('text', '')
-                    self._add_message(from_user, text, "message")
+                    self.root.after(0, lambda u=from_user, t=text: self._add_message(u, t, "message"))
                 elif mtype == 'system':
                     text = msg.get('text', '')
-                    self._add_message("SISTEMA", text, "system")
+                    self.root.after(0, lambda t=text: self._add_message("SISTEMA", t, "system"))
                 elif mtype == 'file_available':
                     from_user = msg.get('from')
                     filename = msg.get('filename')
                     file_id = msg.get('file_id')
                     self.available_files[file_id] = {'filename': filename, 'from': from_user}
-                    self._add_message("SISTEMA", 
-                                    f"{from_user} compartió: {filename} (ID: {file_id})", 
-                                    "file")
+                    info = f"{from_user} compartió: {filename} (ID: {file_id})"
+                    self.root.after(0, lambda text=info: self._add_message("SISTEMA", text, "file"))
                 elif mtype == 'call':
                     action = msg.get('action')
                     from_user = msg.get('from')
                     if action == 'start':
-                        self._add_message("SISTEMA", f"{from_user} inició una videollamada", "system")
+                        self.root.after(0, lambda user=from_user: self._add_message(
+                            "SISTEMA", f"{user} inició una videollamada", "system"))
                     elif action == 'stop':
-                        self._add_message("SISTEMA", f"{from_user} terminó la videollamada", "system")
+                        self.root.after(0, lambda user=from_user: self._add_message(
+                            "SISTEMA", f"{user} terminó la videollamada", "system"))
+                elif mtype == 'audio_message':
+                    from_user = msg.get('from', 'unknown')
+                    file_id = msg.get('file_id')
+                    filename = msg.get('filename')
+                    duration = msg.get('duration', 0)
+                    self.root.after(0, lambda u=from_user, fid=file_id, fn=filename, d=duration:
+                                    self._add_audio_message(u, fid, fn, d))
             except Exception:
                 if self.chat_client and self.chat_client.running:
-                    self._add_message("SISTEMA", "Conexión perdida con el servidor", "error")
+                    self.root.after(0, lambda: self._add_message("SISTEMA",
+                                                                 "Conexión perdida con el servidor",
+                                                                 "error"))
                 break
     
     def _add_message(self, user: str, text: str, msg_type: str = "message"):
@@ -1156,6 +1235,255 @@ class ChatGUI:
         
         self.chat_text.config(state=tk.DISABLED)
         self.chat_text.see(tk.END)
+
+    def _post_message(self, user: str, text: str, msg_type: str = "message"):
+        """Agenda la inserción de un mensaje en el hilo principal de Tk"""
+        self.root.after(0, lambda u=user, t=text, m=msg_type: self._add_message(u, t, m))
+
+    def _format_duration(self, duration: float) -> str:
+        """Devuelve la duración en formato mm:ss"""
+        seconds = max(0, int(round(duration)))
+        minutes = seconds // 60
+        secs = seconds % 60
+        return f"{minutes:02d}:{secs:02d}"
+
+    def _add_audio_message(self, user: str, file_id: str, filename: str, duration: float):
+        """Inserta un mensaje de audio con un botón de reproducción"""
+        if file_id in self.audio_messages and self.audio_messages[file_id].get('rendered'):
+            # Ya fue agregado, no duplicar
+            return
+        
+        local_path = os.path.join(DOWNLOADS_DIR, filename)
+        meta = self.audio_messages.get(file_id, {})
+        meta.update({
+            'filename': filename,
+            'duration': duration,
+            'local_path': local_path if os.path.exists(local_path) else meta.get('local_path'),
+            'downloading': False,
+            'rendered': True
+        })
+        self.audio_messages[file_id] = meta
+        
+        self.chat_text.config(state=tk.NORMAL)
+        container_height = 50
+        container = tk.Frame(self.chat_text, bg=self.colors['bg_secondary'], padx=8, pady=6, height=container_height)
+        container.grid_propagate(False)
+        container.columnconfigure(0, weight=1)
+        container.columnconfigure(1, weight=0)
+        
+        info_frame = tk.Frame(container, bg=self.colors['bg_secondary'], height=container_height-12)
+        info_frame.grid(row=0, column=0, sticky=(tk.W, tk.E))
+        info_frame.grid_propagate(False)
+        info_frame.columnconfigure(1, weight=1)
+        
+        icon_label = tk.Label(
+            info_frame,
+            text="🎙️",
+            bg=self.colors['bg_secondary'],
+            fg=self.colors['fg_main'],
+            font=('Segoe UI', 12, 'bold')
+        )
+        icon_label.grid(row=0, column=0, sticky=tk.W, padx=(0, 5))
+        
+        text_label = tk.Label(
+            info_frame,
+            text=f"[{user}] · {self._format_duration(duration)}",
+            bg=self.colors['bg_secondary'],
+            fg=self.colors['fg_main'],
+            font=('Segoe UI', 10, 'bold'),
+            anchor='w'
+        )
+        text_label.grid(row=0, column=1, sticky=(tk.W, tk.E))
+        
+        play_btn = tk.Button(
+            container,
+            text="▶️ Reproducir",
+            command=lambda fid=file_id: self.play_audio_message(fid),
+            bg=self.colors['bg_button'],
+            fg='white',
+            font=('Segoe UI', 9, 'bold'),
+            relief=tk.FLAT,
+            bd=0,
+            padx=12,
+            cursor='hand2',
+            activebackground=self.colors['bg_button_hover'],
+            activeforeground='white'
+        )
+        play_btn.grid(row=0, column=1, sticky=tk.E, padx=(10, 0))
+        
+        self.chat_text.window_create(tk.END, window=container)
+        self.chat_text.insert(tk.END, "\n")
+        self.chat_text.config(state=tk.DISABLED)
+        self.chat_text.see(tk.END)
+        self.audio_message_frames.append({
+            'frame': container,
+            'info': info_frame,
+            'button': play_btn
+        })
+        self._resize_audio_bubbles()
+        self.root.after_idle(self._resize_audio_bubbles)
+
+    def _resize_audio_bubbles(self, event=None):
+        """Ajusta el ancho de las burbujas de audio según el tamaño del chat"""
+        if not self.audio_message_frames:
+            return
+        available_width = max(160, self.chat_text.winfo_width() - 20)
+        for item in self.audio_message_frames:
+            frame = item.get('frame')
+            info = item.get('info')
+            button = item.get('button')
+            try:
+                frame.configure(width=available_width)
+                info_width = max(80, available_width - (button.winfo_reqwidth() + 30))
+                if info is not None:
+                    info.configure(width=info_width)
+                    info.grid_propagate(False)
+            except Exception:
+                pass
+
+    def _resize_input_controls(self, event=None):
+        """Mantiene tamaños proporcionales para los botones de enviar y audio"""
+        if not hasattr(self, 'send_btn_container') or not hasattr(self, 'audio_btn_container'):
+            return
+        frame_width = max(1, self.input_frame.winfo_width())
+        # Calcular ancho deseado (entre 36 y 52 px) según el ancho disponible
+        target = max(36, min(52, int(frame_width * 0.05)))
+        for col in (1, 2):
+            self.input_frame.columnconfigure(col, minsize=target)
+        for container in (self.send_btn_container, self.audio_btn_container):
+            try:
+                container.configure(width=target)
+            except Exception:
+                pass
+
+    def toggle_audio_recording(self):
+        """Inicia o detiene la grabación de audio"""
+        if self.audio_recording:
+            self._stop_audio_recording()
+        else:
+            self._start_audio_recording()
+
+    def _start_audio_recording(self):
+        if self.audio_recording:
+            return
+        try:
+            self.audio_record_frames = []
+            self.audio_record_stream = sd.InputStream(
+                samplerate=self.audio_sample_rate,
+                channels=self.audio_channels,
+                dtype='int16',
+                callback=self._audio_record_callback
+            )
+            self.audio_record_stream.start()
+            self.audio_record_start = time.time()
+            self.audio_recording = True
+            self.audio_btn.config(text="⏹️", bg=self.colors['error'])
+        except Exception as e:
+            self.audio_record_stream = None
+            self.audio_recording = False
+            self.audio_btn.config(text="🎙️", bg=self.colors['bg_button'])
+            self._post_message("SISTEMA", f"No se pudo iniciar la grabación: {e}", "error")
+
+    def _audio_record_callback(self, indata, frames, time_info, status):  # pragma: no cover - callback
+        if status:
+            print(f'[AUDIO] Record status: {status}')
+        self.audio_record_frames.append(indata.copy())
+
+    def _stop_audio_recording(self):
+        if not self.audio_recording:
+            return
+        self.audio_recording = False
+        self.audio_btn.config(text="🎙️", bg=self.colors['bg_button'])
+        stream = self.audio_record_stream
+        self.audio_record_stream = None
+        if stream:
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:
+                pass
+        duration = time.time() - self.audio_record_start
+        frames_copy = [frame.copy() for frame in self.audio_record_frames]
+        self.audio_record_frames = []
+        if not frames_copy or duration < 0.5:
+            self._post_message("SISTEMA", "Audio demasiado corto", "error")
+            return
+        threading.Thread(
+            target=self._process_audio_recording,
+            args=(frames_copy, duration),
+            daemon=True
+        ).start()
+
+    def _process_audio_recording(self, frames, duration: float):
+        temp_path = None
+        try:
+            audio_data = np.concatenate(frames, axis=0)
+            temp_fd, temp_path = tempfile.mkstemp(suffix='.wav', prefix='voice_')
+            os.close(temp_fd)
+            with wave.open(temp_path, 'wb') as wf:
+                wf.setnchannels(self.audio_channels)
+                wf.setsampwidth(2)  # int16
+                wf.setframerate(self.audio_sample_rate)
+                wf.writeframes(audio_data.tobytes())
+            
+            filename = f"voice_{int(time.time() * 1000)}.wav"
+            final_path = os.path.join(DOWNLOADS_DIR, filename)
+            os.replace(temp_path, final_path)
+            temp_path = None
+            
+            file_id = FileClient.upload_file(self.host, FILE_PORT, final_path)
+            if not file_id:
+                self._post_message("SISTEMA", "No se pudo subir el audio", "error")
+                return
+            if self.chat_client:
+                self.chat_client.send_audio_message(file_id, filename, round(duration, 1))
+            self.root.after(0, lambda fid=file_id, fn=filename, d=duration:
+                            self._add_audio_message(self.username, fid, fn, d))
+        except Exception as e:
+            self._post_message("SISTEMA", f"Error al procesar audio: {e}", "error")
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
+
+    def play_audio_message(self, file_id: str):
+        """Descarga (si es necesario) y reproduce un mensaje de audio"""
+        if file_id not in self.audio_messages:
+            self._post_message("SISTEMA", "Audio no disponible", "error")
+            return
+        meta = self.audio_messages[file_id]
+        if meta.get('downloading'):
+            return
+        
+        def worker():
+            path = meta.get('local_path')
+            if not path or not os.path.exists(path):
+                meta['downloading'] = True
+                success = FileClient.download_file(self.host, FILE_PORT, file_id)
+                meta['downloading'] = False
+                if not success:
+                    self._post_message("SISTEMA", "No se pudo descargar el audio", "error")
+                    return
+                path = os.path.join(DOWNLOADS_DIR, meta['filename'])
+                meta['local_path'] = path
+            self._play_audio_file(path)
+        
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _play_audio_file(self, path: str):
+        """Reproduce un archivo WAV usando sounddevice"""
+        try:
+            sd.stop()
+            with wave.open(path, 'rb') as wf:
+                frames = wf.readframes(wf.getnframes())
+                audio_data = np.frombuffer(frames, dtype=np.int16)
+                audio_data = audio_data.reshape(-1, wf.getnchannels())
+                sd.play(audio_data, wf.getframerate())
+                sd.wait()
+        except Exception as e:
+            self._post_message("SISTEMA", f"No se pudo reproducir el audio: {e}", "error")
     
     def send_message(self):
         """Envía un mensaje"""
@@ -1193,20 +1521,12 @@ class ChatGUI:
                     main_width = self.main_frame.winfo_width()
                     
                     # Configurar los pesos del grid para relación 3:1 (75%:25%)
-                    # Usar solo weight para que se ajuste dinámicamente sin restricciones
-                    self.main_frame.columnconfigure(0, weight=video_weight, minsize=0)
-                    self.main_frame.columnconfigure(1, weight=chat_weight, minsize=0)
+                    # Usar uniform para mantener la proporción de forma consistente
+                    self.main_frame.columnconfigure(0, weight=video_weight, minsize=0, uniform='videochat')
+                    self.main_frame.columnconfigure(1, weight=chat_weight, minsize=0, uniform='videochat')
                     
                     # Resetear ancho del chat_container para que el grid lo controle completamente
                     self.chat_container.config(width=0)
-                    
-                    # Asegurarse de que los widgets internos no tengan restricciones de tamaño
-                    # que puedan causar problemas al redimensionar
-                    self.chat_text.config(width=1)  # Ancho mínimo para ScrolledText
-                    if hasattr(self, 'buttons_frame'):
-                        self.buttons_frame.config(width=0)
-                    if hasattr(self, 'input_frame'):
-                        self.input_frame.config(width=0)
                     
                     # Mostrar video_container en columna 0
                     self.video_container.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(0, 5))
@@ -1221,8 +1541,8 @@ class ChatGUI:
                     self.chat_container.place_forget()
                     # Reposicionar chat para que ocupe todo el espacio con grid
                     self.chat_container.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S))
-                    self.main_frame.columnconfigure(0, weight=1, minsize=0)
-                    self.main_frame.columnconfigure(1, weight=0, minsize=0)
+                    self.main_frame.columnconfigure(0, weight=1, minsize=0, uniform=None)
+                    self.main_frame.columnconfigure(1, weight=0, minsize=0, uniform=None)
                     self.chat_container.config(width=0)
                 
                 # Forzar actualización del layout
